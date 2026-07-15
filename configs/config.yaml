@@ -1,0 +1,86 @@
+server:
+  addr: ":8080"
+  read_timeout: 30s
+  write_timeout: 60s
+  # 绑定域名（校验 Host）。仅 HTTP，暂不启用 HTTPS。
+  # 为空则不校验 Host（方便本地直接用 IP 访问）。
+  domains:
+    - "rpc.example.com"
+    - "localhost"
+    - "127.0.0.1"
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+  # 无 Redis 时自动降级为进程内限流/计数；本地可先 false
+  enabled: false
+
+# 套餐：双限流 + 方法策略
+# 限流对所有 token 生效（含 billing_free=true 的免费 token）
+plans:
+  free:
+    # 1) 某 token 在某 IP 下的限流
+    token_ip_rate_limit_per_second: 3
+    token_ip_rate_limit_burst: 6
+    # 2) 某 token 不分 IP 的全局限流
+    token_rate_limit_per_second: 5
+    token_rate_limit_burst: 10
+    # 日成功次数上限（用量保护，与是否计费无关）
+    daily_quota: 10000
+    denied_methods:
+      - eth_sendRawTransaction
+      - personal_sendTransaction
+      - debug_traceTransaction
+      - debug_traceCall
+  pro:
+    token_ip_rate_limit_per_second: 30
+    token_ip_rate_limit_burst: 60
+    token_rate_limit_per_second: 50
+    token_rate_limit_burst: 100
+    daily_quota: 1000000
+    denied_methods:
+      - personal_sendTransaction
+      - debug_traceTransaction
+
+# API Token：访问路径为 http://{domain}/{token}/{chain}
+tokens:
+  - key: "demo-free-token"
+    plan: free
+    name: "demo-free"
+    enabled: true
+    # 免费：成功调用不计费，但仍受上述限流约束
+    billing_free: true
+  - key: "demo-pro-token"
+    plan: pro
+    name: "demo-pro"
+    enabled: true
+    billing_free: false
+
+# 按链维护上游节点池；路径段为 map key，例如 /{token}/eth
+chains:
+  eth:
+    name: "Ethereum"
+    nodes:
+      - url: "https://ethereum.publicnode.com"
+        weight: 3
+      - url: "https://rpc.ankr.com/eth"
+        weight: 1
+  bsc:
+    name: "BNB Smart Chain"
+    nodes:
+      - url: "https://bsc-dataseed.binance.org"
+        weight: 2
+      - url: "https://bsc.publicnode.com"
+        weight: 1
+
+health_check:
+  interval: 30s
+  timeout: 5s
+  unhealthy_threshold: 3
+  healthy_threshold: 2
+
+billing:
+  # redis_stream | log
+  publisher: log
+  stream_key: "rpc:billing:events"

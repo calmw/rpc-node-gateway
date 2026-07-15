@@ -1,0 +1,9 @@
+.idea/
+*.iml
+bin/
+dist/
+*.exe
+*.test
+*.out
+.DS_Store
+.idea/
