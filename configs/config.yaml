@@ -16,7 +16,15 @@ redis:
   # 无 Redis 时自动降级为进程内限流/计数；本地可先 false
   enabled: false
 
-# 套餐：双限流 + 方法策略
+# PostgreSQL：Token / 用户 / 计费账本。本地演示可先 false，继续用下方 YAML tokens。
+database:
+  enabled: false
+  dsn: "postgres://postgres:postgres@127.0.0.1:5432/rpc_gateway?sslmode=disable"
+  max_conns: 10
+  min_conns: 1
+  token_refresh: 30s
+
+# 套餐：双限流 + 方法策略（database.enabled=false 时生效；启用 DB 后以库内 plans 为准）
 # 限流对所有 token 生效（含 billing_free=true 的免费 token）
 plans:
   free:
@@ -57,22 +65,36 @@ tokens:
     enabled: true
     billing_free: false
 
-# 按链维护上游节点池；路径段为 map key，例如 /{token}/eth
+# 网络（chain）固定：访问路径 /{token}/{chain}，后期一般不增网络、只扩节点。
+# 每个网络下 nodes 可 1→N：加权轮询 + 健康检查；改完配置后 SIGHUP 或 POST /admin/upstreams/reload 热更新。
 chains:
+  # 主网
   eth:
-    name: "Ethereum"
+    name: "Ethereum Mainnet"
     nodes:
-      - url: "https://ethereum.publicnode.com"
-        weight: 3
-      - url: "https://rpc.ankr.com/eth"
+      - name: "publicnode-1"
+        url: "https://ethereum.publicnode.com"
+        ws_url: "wss://ethereum.publicnode.com"
         weight: 1
-  bsc:
-    name: "BNB Smart Chain"
+      # 后期主网扩到 2 个节点，直接追加即可，例如：
+      # - name: "publicnode-2"
+      #   url: "https://rpc.ankr.com/eth"
+      #   weight: 1
+  # 测试网
+  sepolia:
+    name: "Ethereum Sepolia"
     nodes:
-      - url: "https://bsc-dataseed.binance.org"
-        weight: 2
-      - url: "https://bsc.publicnode.com"
+      - name: "publicnode-sepolia-1"
+        url: "https://ethereum-sepolia.publicnode.com"
+        ws_url: "wss://ethereum-sepolia.publicnode.com"
         weight: 1
+
+# WebSocket：与 HTTP 同路径 Upgrade；入站 RPC 与推送均按「成功次数」计量（同权）
+websocket:
+  enabled: true
+  max_connections_per_token: 5
+  max_subscriptions_per_connection: 20
+  notification_bill_units: 1
 
 health_check:
   interval: 30s
@@ -81,6 +103,22 @@ health_check:
   healthy_threshold: 2
 
 billing:
-  # redis_stream | log
+  # log | redis_stream | postgres
+  # 若 database.enabled=true，无论 publisher 为何都会额外写入 PostgreSQL 账本表
   publisher: log
   stream_key: "rpc:billing:events"
+
+# 统计查询接口 /admin/stats* —— JWT 鉴权
+# Token 由进程内定时任务签发并写入数据库（database.enabled=false 时写入内存）
+admin:
+  enabled: true
+  jwt:
+    secret: "change-me-admin-jwt-secret"
+    issuer: "rpc-node-gateway"
+    subject: "admin-stats"
+    ttl: 24h
+    rotate_every: 1h
+    rotate_on_start: true
+    revoke_previous: true   # 新签发时吊销旧 token
+    cleanup_retention: 168h # 过期 7 天后清理
+    log_token: true         # 本地调试打印 JWT；生产请改 false，从 DB 读取

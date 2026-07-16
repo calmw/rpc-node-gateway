@@ -54,29 +54,36 @@ func ParseMethods(body []byte) ([]string, error) {
 
 // CountSuccess 统计响应中无 error 的条数，支持单条与 batch。
 func CountSuccess(body []byte) int {
+	ok, _ := CountResults(body)
+	return ok
+}
+
+// CountResults 返回成功条数与 error 条数。
+func CountResults(body []byte) (success, errors int) {
 	body = bytes.TrimSpace(body)
 	if len(body) == 0 {
-		return 0
+		return 0, 0
 	}
 	if body[0] == '[' {
 		var batch []Response
 		if err := json.Unmarshal(body, &batch); err != nil {
-			return 0
+			return 0, 0
 		}
-		n := 0
 		for _, item := range batch {
 			if item.Error == nil {
-				n++
+				success++
+			} else {
+				errors++
 			}
 		}
-		return n
+		return success, errors
 	}
 	var single Response
 	if err := json.Unmarshal(body, &single); err != nil {
-		return 0
+		return 0, 0
 	}
 	if single.Error == nil {
-		return 1
+		return 1, 0
 	}
-	return 0
+	return 0, 1
 }

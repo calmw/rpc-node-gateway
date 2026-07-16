@@ -17,18 +17,23 @@ import (
 	"github.com/cisco/rpc-node-gateway/internal/jsonrpc"
 	"github.com/cisco/rpc-node-gateway/internal/model"
 	"github.com/cisco/rpc-node-gateway/internal/ratelimit"
+	"github.com/cisco/rpc-node-gateway/internal/stats"
 	"github.com/go-chi/chi/v5"
 )
 
 // Domain 校验 Host 是否在绑定域名列表中（仅 HTTP，不做 TLS）。
 type Domain struct {
 	Domains []string
+	Stats   *stats.Collector
 }
 
 func (d Domain) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !config.HostAllowed(d.Domains, r.Host) {
 			slog.Warn("domain_rejected", "host", r.Host)
+			if d.Stats != nil {
+				d.Stats.IncDomainRejected()
+			}
 			writeErr(w, http.StatusForbidden, -32010, "host not allowed")
 			return
 		}
@@ -39,17 +44,24 @@ func (d Domain) Middleware(next http.Handler) http.Handler {
 // PathAuth 从路径 /{token}/... 取 token，不再使用 Header。
 type PathAuth struct {
 	Tokens *auth.Store
+	Stats  *stats.Collector
 }
 
 func (a PathAuth) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimSpace(chi.URLParam(r, "token"))
 		if key == "" {
+			if a.Stats != nil {
+				a.Stats.IncAuthFailed()
+			}
 			writeErr(w, http.StatusUnauthorized, -32001, "missing api token in path")
 			return
 		}
 		token, ok := a.Tokens.Lookup(key)
 		if !ok {
+			if a.Stats != nil {
+				a.Stats.IncAuthFailed()
+			}
 			writeErr(w, http.StatusUnauthorized, -32001, "invalid api token")
 			return
 		}
@@ -69,9 +81,11 @@ func (c Chain) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-type MethodFilter struct{}
+type MethodFilter struct {
+	Stats *stats.Collector
+}
 
-func (MethodFilter) Middleware(next http.Handler) http.Handler {
+func (m MethodFilter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
 		if err != nil {
@@ -93,6 +107,15 @@ func (MethodFilter) Middleware(next http.Handler) http.Handler {
 				"methods", methods,
 				"err", err.Error(),
 			)
+			if m.Stats != nil {
+				m.Stats.IncMethodDenied(stats.TokenMeta{
+					Key:         token.Key,
+					Name:        token.Name,
+					Plan:        token.Plan,
+					BillingFree: token.BillingFree,
+					Enabled:     token.Enabled,
+				})
+			}
 			writeErr(w, http.StatusForbidden, -32601, err.Error())
 			return
 		}
@@ -103,6 +126,7 @@ func (MethodFilter) Middleware(next http.Handler) http.Handler {
 
 type RateLimit struct {
 	Limiter *ratelimit.Limiter
+	Stats   *stats.Collector
 }
 
 func (m RateLimit) Middleware(next http.Handler) http.Handler {
@@ -112,6 +136,15 @@ func (m RateLimit) Middleware(next http.Handler) http.Handler {
 		clientIP := httputil.ClientIP(r)
 		res := m.Limiter.Allow(r.Context(), token, chainID, clientIP)
 		if !res.Allowed {
+			if m.Stats != nil {
+				m.Stats.IncRateLimited(stats.TokenMeta{
+					Key:         token.Key,
+					Name:        token.Name,
+					Plan:        token.Plan,
+					BillingFree: token.BillingFree,
+					Enabled:     token.Enabled,
+				})
+			}
 			writeErr(w, http.StatusTooManyRequests, -32005, "rate limited: "+res.Reason)
 			return
 		}

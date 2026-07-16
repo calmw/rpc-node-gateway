@@ -16,6 +16,7 @@ import (
 	"github.com/cisco/rpc-node-gateway/internal/jsonrpc"
 	"github.com/cisco/rpc-node-gateway/internal/model"
 	"github.com/cisco/rpc-node-gateway/internal/ratelimit"
+	"github.com/cisco/rpc-node-gateway/internal/stats"
 	"github.com/google/uuid"
 )
 
@@ -23,14 +24,16 @@ type Handler struct {
 	Registry *balancer.Registry
 	Limiter  *ratelimit.Limiter
 	Billing  billing.Publisher
+	Stats    *stats.Collector
 	Client   *http.Client
 }
 
-func NewHandler(reg *balancer.Registry, lim *ratelimit.Limiter, bill billing.Publisher) *Handler {
+func NewHandler(reg *balancer.Registry, lim *ratelimit.Limiter, bill billing.Publisher, st *stats.Collector) *Handler {
 	return &Handler{
 		Registry: reg,
 		Limiter:  lim,
 		Billing:  bill,
+		Stats:    st,
 		Client: &http.Client{
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
@@ -56,6 +59,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusUnauthorized, -32001, "unauthorized")
 		return
 	}
+	meta := stats.TokenMeta{
+		Key:         token.Key,
+		Name:        token.Name,
+		Plan:        token.Plan,
+		BillingFree: token.BillingFree,
+		Enabled:     token.Enabled,
+	}
 
 	pool, ok := h.Registry.Pool(chainID)
 	if !ok {
@@ -71,6 +81,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	node, ok := pool.Next()
 	if !ok {
+		if h.Stats != nil {
+			h.Stats.RecordProxy(meta, chainID, 0, 0, true, false)
+		}
 		writeJSONError(w, http.StatusBadGateway, -32003, "no upstream available")
 		return
 	}
@@ -92,6 +105,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
+		if h.Stats != nil {
+			h.Stats.RecordProxy(meta, chainID, 0, 0, true, false)
+		}
 		writeJSONError(w, http.StatusBadGateway, -32004, "upstream unavailable")
 		return
 	}
@@ -102,39 +118,57 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		pool.ReportSuccess(node)
 	}
 
-	successN := 0
+	successN, rpcErrN := 0, 0
 	if status >= 200 && status < 300 {
-		successN = jsonrpc.CountSuccess(respBody)
+		successN, rpcErrN = jsonrpc.CountResults(respBody)
+	} else if status >= 500 {
+		if h.Stats != nil {
+			h.Stats.RecordProxy(meta, chainID, 0, 0, true, !token.BillingFree)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(respBody)
+		return
 	}
+
+	billable := !token.BillingFree
+	if h.Stats != nil {
+		h.Stats.RecordProxy(meta, chainID, successN, rpcErrN, false, billable)
+	}
+
 	if successN > 0 {
-		// 日配额对所有 token 计数（含免费）
 		h.Limiter.IncrSuccess(r.Context(), token.Key, successN)
 
-		billable := !token.BillingFree
-		ev := model.BillingEvent{
-			EventID:   uuid.NewString(),
-			TokenKey:  token.Key,
-			TokenName: token.Name,
-			Plan:      token.Plan,
-			ChainID:   chainID,
-			Methods:   methods,
-			SuccessN:  successN,
-			Billable:  billable,
-			Upstream:  node.URL,
-			LatencyMs: latency.Milliseconds(),
-			ClientIP:  clientIP,
-			At:        time.Now().UTC(),
+		amount := 0
+		if billable && token.PricePerSuccessCents > 0 {
+			amount = token.PricePerSuccessCents * successN
 		}
-		// 免费 token 不进入计费流水；仍打 debug 便于审计
-		if billable {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				defer cancel()
-				if err := h.Billing.Publish(ctx, ev); err != nil {
-					slog.Error("publish billing event failed", "err", err)
-				}
-			}()
-		} else {
+		ev := model.BillingEvent{
+			EventID:     uuid.NewString(),
+			TokenKey:    token.Key,
+			TokenName:   token.Name,
+			UserID:      token.UserID,
+			Plan:        token.Plan,
+			ChainID:     chainID,
+			Methods:     methods,
+			SuccessN:    successN,
+			Billable:    billable,
+			AmountCents: amount,
+			Transport:   "http",
+			EventKind:   "rpc",
+			Upstream:    node.URL,
+			LatencyMs:   latency.Milliseconds(),
+			ClientIP:    clientIP,
+			At:          time.Now().UTC(),
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := h.Billing.Publish(ctx, ev); err != nil {
+				slog.Error("publish billing event failed", "err", err)
+			}
+		}()
+		if !billable {
 			slog.Info("success_free",
 				"token", token.Key,
 				"chain", chainID,
